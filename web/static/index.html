@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Beyond The Pitch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,600;1,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- Left rail: case list -->
+  <aside class="rail">
+    <div class="rail-header">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" width="30" height="30" aria-hidden="true">
+          <circle cx="16" cy="16" r="13" fill="none" stroke="var(--accent)" stroke-width="1.4" opacity="0.55"/>
+          <circle cx="16" cy="16" r="8" fill="none" stroke="var(--accent)" stroke-width="1.4" opacity="0.8"/>
+          <path d="M9 21 L23 7 M23 7 L16 7 M23 7 L23 14" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <h1>Beyond The Pitch</h1>
+      </div>
+      <p class="rail-sub">Evidence-based submission scoring</p>
+    </div>
+
+    <button class="new-btn" id="newSubmissionBtn">
+      <span class="plus">+</span> New submission
+    </button>
+
+    <div class="rail-section-label">Submissions</div>
+    <nav class="case-list" id="caseList">
+      <div class="empty-hint">
+        <svg viewBox="0 0 40 40" width="30" height="30" aria-hidden="true" style="margin-bottom:8px;">
+          <rect x="8" y="6" width="24" height="30" rx="3" fill="none" stroke="var(--sidebar-text-soft)" stroke-width="1.3" opacity="0.5"/>
+          <line x1="13" y1="14" x2="27" y2="14" stroke="var(--sidebar-text-soft)" stroke-width="1.3" opacity="0.4"/>
+          <line x1="13" y1="20" x2="27" y2="20" stroke="var(--sidebar-text-soft)" stroke-width="1.3" opacity="0.4"/>
+          <line x1="13" y1="26" x2="22" y2="26" stroke="var(--sidebar-text-soft)" stroke-width="1.3" opacity="0.4"/>
+        </svg>
+        <div>No submissions yet.<br>Add one to begin.</div>
+      </div>
+    </nav>
+
+    <div class="rail-footer">
+      <button class="leaderboard-btn" id="leaderboardBtn">
+        <span>Leaderboard</span><span class="btn-arrow">→</span>
+      </button>
+      <button class="leaderboard-btn" id="weightsBtn">
+        <span>Rubric weights</span><span class="btn-arrow">⚙</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main panel -->
+  <main class="main" id="mainPanel">
+    <div class="welcome">
+      <svg class="welcome-mark" viewBox="0 0 64 64" width="52" height="52" aria-hidden="true">
+        <circle cx="32" cy="32" r="26" fill="none" stroke="var(--accent)" stroke-width="1.3" opacity="0.4"/>
+        <circle cx="32" cy="32" r="17" fill="none" stroke="var(--accent)" stroke-width="1.3" opacity="0.65"/>
+        <circle cx="32" cy="32" r="8" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.3"/>
+        <path d="M18 42 L46 14 M46 14 L32 14 M46 14 L46 28" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h2>Look beyond the pitch.</h2>
+      <p>Add a submission from the left to run it through the rubric: code quality, README clarity, demo completeness, business impact, and novelty — each scored with evidence, not presentation-driven gut calls.</p>
+    </div>
+  </main>
+
+</div>
+
+<!-- Rubric weights modal -->
+<div class="modal-backdrop" id="weightsModalBackdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Rubric weights</h3>
+      <button class="modal-close" id="weightsModalClose">&times;</button>
+    </div>
+    <p class="weights-hint">
+      Adjust how much each dimension counts toward the overall score —
+      e.g. lower Demo Completeness for tracks that don't require a live
+      demo. Weights don't need to sum to 100%; they're normalized
+      automatically. Changes apply to submissions scored <em>after</em>
+      you save — re-run evaluation on existing ones to reflect new weights.
+    </p>
+    <div id="weightsForm" class="weights-form"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn-secondary" id="weightsResetBtn">Reset to defaults</button>
+      <button type="button" class="btn-primary" id="weightsSaveBtn">Save weights</button>
+    </div>
+  </div>
+</div>
+
+<!-- New submission modal -->
+<div class="modal-backdrop" id="modalBackdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>New submission</h3>
+      <button class="modal-close" id="modalClose">&times;</button>
+    </div>
+    <form id="submissionForm" class="modal-form">
+      <div class="field-row">
+        <label>Team name
+          <input type="text" name="team_name" required placeholder="Team Alpha" />
+        </label>
+        <label>Project title
+          <input type="text" name="project_title" required placeholder="SmartQueue" />
+        </label>
+      </div>
+
+      <label>Problem statement
+        <textarea name="problem_statement" rows="2" placeholder="What problem does this solve?"></textarea>
+      </label>
+
+      <label>Business impact pitch
+        <textarea name="business_impact_pitch" rows="2" placeholder="Who benefits, and how much?"></textarea>
+      </label>
+
+      <label>Tech stack
+        <input type="text" name="tech_stack" placeholder="Python, FastAPI, React" />
+      </label>
+
+      <div class="field-row">
+        <label>Demo evidence
+          <select name="demo_kind">
+            <option value="none">None provided</option>
+            <option value="live_url">Live URL</option>
+            <option value="video_url">Video URL</option>
+            <option value="screenshots">Screenshots</option>
+          </select>
+        </label>
+        <label>Demo link / note
+          <input type="text" name="demo_value" placeholder="https://..." />
+        </label>
+      </div>
+
+      <label>Code folder (.zip)
+        <input type="file" name="code_zip" accept=".zip" />
+      </label>
+
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" id="modalCancel">Cancel</button>
+        <button type="submit" class="btn-primary">Ingest submission</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
