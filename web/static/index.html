@@ -10,7 +10,30 @@
 </head>
 <body>
 
-<div class="app">
+<!-- Login screen -->
+<div class="login-screen" id="loginScreen">
+  <form class="login-card" id="loginForm">
+    <div class="brand" style="justify-content:center; margin-bottom: 6px;">
+      <svg class="brand-mark" viewBox="0 0 32 32" width="30" height="30" aria-hidden="true">
+        <circle cx="16" cy="16" r="13" fill="none" stroke="var(--accent)" stroke-width="1.4" opacity="0.55"/>
+        <circle cx="16" cy="16" r="8" fill="none" stroke="var(--accent)" stroke-width="1.4" opacity="0.8"/>
+        <path d="M9 21 L23 7 M23 7 L16 7 M23 7 L23 14" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h1 style="color:var(--ink)">Beyond The Pitch</h1>
+    </div>
+    <p class="login-sub">Sign in to judge or manage this event.</p>
+    <label>Username
+      <input type="text" name="username" required autofocus autocomplete="username" />
+    </label>
+    <label>Password
+      <input type="password" name="password" required autocomplete="current-password" />
+    </label>
+    <div class="login-error" id="loginError"></div>
+    <button type="submit" class="btn-primary" id="loginSubmitBtn">Log in</button>
+  </form>
+</div>
+
+<div class="app" id="appRoot" style="display:none;">
 
   <!-- Left rail: case list -->
   <aside class="rail">
@@ -26,7 +49,15 @@
       <p class="rail-sub">Evidence-based submission scoring</p>
     </div>
 
-    <button class="new-btn" id="newSubmissionBtn">
+    <div class="user-badge" id="userBadge">
+      <div class="user-badge-info">
+        <span class="user-name" id="userName"></span>
+        <span class="user-role" id="userRole"></span>
+      </div>
+      <button class="logout-btn" id="logoutBtn" title="Log out">⏻</button>
+    </div>
+
+    <button class="new-btn admin-only" id="newSubmissionBtn">
       <span class="plus">+</span> New submission
     </button>
 
@@ -45,9 +76,15 @@
 
     <div class="rail-footer">
       <button class="leaderboard-btn" id="leaderboardBtn">
-        <span>Leaderboard</span><span class="btn-arrow">→</span>
+        <span>AI leaderboard</span><span class="btn-arrow">→</span>
       </button>
-      <button class="leaderboard-btn" id="weightsBtn">
+      <button class="leaderboard-btn" id="juryLeaderboardBtn">
+        <span>Jury leaderboard</span><span class="btn-arrow">→</span>
+      </button>
+      <button class="leaderboard-btn admin-only" id="judgingSetupBtn">
+        <span>Judging setup</span><span class="btn-arrow">⚙</span>
+      </button>
+      <button class="leaderboard-btn admin-only" id="weightsBtn">
         <span>Rubric weights</span><span class="btn-arrow">⚙</span>
       </button>
     </div>
@@ -87,6 +124,43 @@
     <div class="modal-actions">
       <button type="button" class="btn-secondary" id="weightsResetBtn">Reset to defaults</button>
       <button type="button" class="btn-primary" id="weightsSaveBtn">Save weights</button>
+    </div>
+  </div>
+</div>
+
+<!-- Judging setup modal (admin) -->
+<div class="modal-backdrop" id="judgingModalBackdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Judging setup</h3>
+      <button class="modal-close" id="judgingModalClose">&times;</button>
+    </div>
+
+    <div class="judging-section">
+      <div class="section-title">Judging mode</div>
+      <p class="weights-hint">
+        <strong>Split</strong>: each submission is judged by one assigned jury.
+        <strong>All</strong>: every jury scores every submission.
+      </p>
+      <div class="mode-toggle" id="modeToggle">
+        <button type="button" class="mode-btn" data-mode="all">All juries score every submission</button>
+        <button type="button" class="mode-btn" data-mode="split">Split submissions across juries</button>
+      </div>
+      <button type="button" class="btn-secondary" id="autoSplitBtn" style="margin-top:10px;">
+        Auto-split submissions round-robin
+      </button>
+    </div>
+
+    <div class="judging-section">
+      <div class="section-title">Jury accounts</div>
+      <div id="juryList" class="jury-list"></div>
+      <form id="newJuryForm" class="jury-add-form">
+        <input type="text" name="username" placeholder="Username" required />
+        <input type="text" name="display_name" placeholder="Display name (optional)" />
+        <input type="password" name="password" placeholder="Password (min 6 chars)" required minlength="6" />
+        <button type="submit" class="btn-primary">Add jury</button>
+      </form>
+      <div class="judging-error" id="juryError"></div>
     </div>
   </div>
 </div>

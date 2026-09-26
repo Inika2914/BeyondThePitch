@@ -6,16 +6,17 @@ adapters/, models/, and scoring/ are untouched. The web app:
   1. accepts a submission (zip upload + form metadata),
   2. runs it through FolderAdapter -> SubmissionBundle (unchanged),
   3. runs scoring.engine.evaluate() (unchanged),
-  4. stores the result in memory,
-  5. serves it to the dashboard as JSON, and recomputes the calibrated
+  4. stores the result in SQLite (web/data.db, via web/db.py), and
+     serves it to the dashboard as JSON, and recomputes the calibrated
      leaderboard via scoring.aggregator.calibrate_pool() (unchanged)
      whenever more than one submission has been scored.
 
-In-memory storage is intentional for a hackathon-day tool — see README
-for the swap-in-a-database note if this needs to persist across restarts.
+Storage lives in web/db.py — a thin SQLite repository — so submissions
+and scores survive a server restart. Delete web/data.db to reset.
 """
 
 import io
+import json
 import sys
 import uuid
 import zipfile
@@ -23,27 +24,30 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, Form, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, UploadFile, Form, File, HTTPException, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # repo root on path
 
 from adapters.folder_adapter import FolderAdapter
-from scoring.engine import evaluate, EvaluationResult
+from scoring.engine import evaluate, evaluate_stream, EvaluationResult
 from scoring.aggregator import calibrate_pool
 from scoring import rubrics
+from web import auth, db, jury_scoring
 
 app = FastAPI(title="Beyond The Pitch")
 
 UPLOAD_ROOT = Path(__file__).parent / "_uploads"
 UPLOAD_ROOT.mkdir(exist_ok=True)
 
-# In-memory store: submission_id -> record dict
-# record = {meta..., "status": "pending"|"scoring"|"scored"|"error",
-#           "result": EvaluationResult | None, "error": str | None}
-SUBMISSIONS: dict[str, dict] = {}
+db.init_db()
+auth.seed_admin_if_needed()
+
+# Persistence now lives in web/db.py (SQLite, web/data.db) instead of an
+# in-memory dict — submissions and scores survive a server restart.
+# Every place that used to do SUBMISSIONS[sid] now goes through db.*.
 
 
 def _submission_summary(sid: str, record: dict) -> dict:
@@ -69,6 +73,7 @@ async def create_submission(
     demo_value: str = Form(""),
     demo_notes: str = Form(""),
     code_zip: Optional[UploadFile] = File(None),
+    admin=Depends(auth.require_admin),
 ):
     """Create a submission from form fields + an optional zip of the
     team's code folder. Ingests immediately; scoring is a separate call
@@ -107,52 +112,115 @@ async def create_submission(
     except Exception as e:
         raise HTTPException(400, f"Ingestion failed: {e}")
 
-    SUBMISSIONS[sid] = {
-        "team_name": team_name,
-        "project_title": project_title,
-        "bundle": bundle,
-        "status": "ingested",
-        "result": None,
-        "error": None,
-        "code_file_count": len(bundle.code_files),
-        "has_readme": bool(bundle.readme_text),
-    }
-    return _submission_summary(sid, SUBMISSIONS[sid]) | {
+    db.create_submission(
+        sid, team_name, project_title, bundle,
+        status="ingested",
+        code_file_count=len(bundle.code_files),
+        has_readme=bool(bundle.readme_text),
+    )
+    record = db.get_submission(sid)
+    return _submission_summary(sid, record) | {
         "code_file_count": len(bundle.code_files),
         "has_readme": bool(bundle.readme_text),
     }
 
 
 @app.post("/api/submissions/{sid}/evaluate")
-def evaluate_submission(sid: str):
+def evaluate_submission(sid: str, admin=Depends(auth.require_admin)):
     """Run the (unchanged) scoring engine against this submission's
     bundle. Synchronous — fine for hackathon-day submission volumes."""
-    record = SUBMISSIONS.get(sid)
+    record = db.get_submission(sid)
     if not record:
         raise HTTPException(404, "Submission not found.")
 
-    record["status"] = "scoring"
+    db.set_status(sid, "scoring")
     try:
         result = evaluate(record["bundle"])
-        record["result"] = result
-        record["status"] = "scored"
-        record["error"] = None
+        db.save_result(sid, result)
     except Exception as e:
-        record["status"] = "error"
-        record["error"] = str(e)
+        db.set_status(sid, "error", str(e))
         raise HTTPException(500, f"Scoring failed: {e}")
 
     return submission_detail(sid)
 
 
+@app.post("/api/submissions/{sid}/evaluate/stream")
+def evaluate_submission_stream(sid: str, admin=Depends(auth.require_admin)):
+    """Same scoring pass as /evaluate, but streamed as Server-Sent Events
+    so the UI can show live progress ('Scoring Code Quality…', etc.)
+    instead of a single blocking spinner. Each dimension call to the LLM
+    takes a few seconds; this surfaces that instead of hiding it."""
+    record = db.get_submission(sid)
+    if not record:
+        raise HTTPException(404, "Submission not found.")
+
+    def _sse(event: dict) -> str:
+        return f"data: {json.dumps(event)}\n\n"
+
+    def _gen():
+        db.set_status(sid, "scoring")
+        try:
+            for event in evaluate_stream(record["bundle"]):
+                if event["stage"] == "dimension":
+                    payload = {
+                        "stage": "dimension",
+                        "status": event["status"],
+                        "key": event["key"],
+                        "label": event["label"],
+                    }
+                    if event["status"] == "done":
+                        payload["score"] = asdict(event["score"])
+                    if event["status"] == "error":
+                        payload["error"] = event["error"]
+                    yield _sse(payload)
+                elif event["stage"] == "summary":
+                    payload = {"stage": "summary", "status": event["status"]}
+                    if event.get("error"):
+                        payload["error"] = event["error"]
+                    yield _sse(payload)
+                elif event["stage"] == "final":
+                    db.save_result(sid, event["result"])
+                    yield _sse({
+                        "stage": "final",
+                        "status": "done",
+                        "detail": submission_detail(sid),
+                    })
+        except Exception as e:
+            db.set_status(sid, "error", str(e))
+            yield _sse({"stage": "fatal", "status": "error", "error": str(e)})
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable proxy buffering (e.g. nginx)
+        },
+    )
+
+
 @app.get("/api/submissions")
-def list_submissions():
-    return [_submission_summary(sid, r) for sid, r in SUBMISSIONS.items()]
+def list_submissions(user=Depends(auth.current_user)):
+    items = db.list_submissions()
+    if user["role"] == "jury":
+        items = [
+            (sid, r) for sid, r in items
+            if jury_scoring.can_jury_access(sid, user["id"])
+        ]
+    return [_submission_summary(sid, r) for sid, r in items]
 
 
 @app.get("/api/submissions/{sid}")
-def submission_detail(sid: str):
-    record = SUBMISSIONS.get(sid)
+def get_submission_detail(sid: str, user=Depends(auth.current_user)):
+    if user["role"] == "jury" and not jury_scoring.can_jury_access(sid, user["id"]):
+        raise HTTPException(404, "Submission not found.")
+    return submission_detail(sid)
+
+
+def submission_detail(sid: str) -> dict:
+    """Internal helper (also called from the evaluate endpoints, which
+    already did their own admin-auth check) — not itself a route."""
+    record = db.get_submission(sid)
     if not record:
         raise HTTPException(404, "Submission not found.")
 
@@ -179,9 +247,9 @@ def submission_detail(sid: str):
 
 
 @app.get("/api/leaderboard")
-def leaderboard():
+def leaderboard(user=Depends(auth.current_user)):
     scored = [
-        (sid, r["result"]) for sid, r in SUBMISSIONS.items()
+        (sid, r["result"]) for sid, r in db.list_submissions()
         if r.get("result") is not None
     ]
     if not scored:
@@ -207,10 +275,9 @@ def leaderboard():
 
 
 @app.delete("/api/submissions/{sid}")
-def delete_submission(sid: str):
-    if sid not in SUBMISSIONS:
+def delete_submission(sid: str, admin=Depends(auth.require_admin)):
+    if not db.delete_submission(sid):
         raise HTTPException(404, "Submission not found.")
-    del SUBMISSIONS[sid]
     return {"deleted": sid}
 
 
@@ -233,7 +300,7 @@ class WeightsUpdate(BaseModel):
 
 
 @app.get("/api/config/weights")
-def get_rubric_weights():
+def get_rubric_weights(user=Depends(auth.current_user)):
     return {
         "weights": rubrics.get_weights(),
         "defaults": rubrics.get_default_weights(),
@@ -244,7 +311,7 @@ def get_rubric_weights():
 
 
 @app.put("/api/config/weights")
-def update_rubric_weights(payload: WeightsUpdate):
+def update_rubric_weights(payload: WeightsUpdate, admin=Depends(auth.require_admin)):
     try:
         updated = rubrics.set_weights(payload.weights)
     except ValueError as e:
@@ -253,8 +320,213 @@ def update_rubric_weights(payload: WeightsUpdate):
 
 
 @app.post("/api/config/weights/reset")
-def reset_rubric_weights():
+def reset_rubric_weights(admin=Depends(auth.require_admin)):
     return {"weights": rubrics.reset_weights()}
+
+
+# --- Auth --------------------------------------------------------------
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginPayload, response: Response):
+    token, user = auth.login(payload.username, payload.password)
+    response.set_cookie(
+        auth.SESSION_COOKIE, token,
+        httponly=True, samesite="lax", max_age=60 * 60 * 24 * 7,
+    )
+    return user
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    auth.logout(request.cookies.get(auth.SESSION_COOKIE))
+    response.delete_cookie(auth.SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(user=Depends(auth.current_user)):
+    return user
+
+
+# --- Admin: jury accounts, judging mode, assignment, reveal ------------
+#
+# Everything here requires an admin session. Admin creates jury accounts
+# (there's no public signup), picks the judging mode for the event, and
+# controls assignment + blind-reveal overrides.
+
+class JuryAccountCreate(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+
+
+@app.get("/api/admin/juries")
+def list_juries(admin=Depends(auth.require_admin)):
+    return [
+        {"id": u["id"], "username": u["username"], "display_name": u["display_name"]}
+        for u in db.list_users(role="jury")
+    ]
+
+
+@app.post("/api/admin/juries")
+def create_jury(payload: JuryAccountCreate, admin=Depends(auth.require_admin)):
+    user = auth.create_user(payload.username, payload.password, role="jury",
+                             display_name=payload.display_name)
+    return {"id": user["id"], "username": user["username"], "display_name": user["display_name"]}
+
+
+@app.delete("/api/admin/juries/{jury_id}")
+def delete_jury(jury_id: str, admin=Depends(auth.require_admin)):
+    if not db.delete_user(jury_id):
+        raise HTTPException(404, "Jury account not found.")
+    db.delete_sessions_for_user(jury_id)
+    return {"deleted": jury_id}
+
+
+class ConfigUpdate(BaseModel):
+    judging_mode: str
+
+
+@app.get("/api/admin/config")
+def get_config(admin=Depends(auth.require_admin)):
+    return {"judging_mode": db.get_judging_mode()}
+
+
+@app.put("/api/admin/config")
+def update_config(payload: ConfigUpdate, admin=Depends(auth.require_admin)):
+    if payload.judging_mode not in ("split", "all"):
+        raise HTTPException(400, "judging_mode must be 'split' or 'all'.")
+    db.set_judging_mode(payload.judging_mode)
+    return {"judging_mode": payload.judging_mode}
+
+
+@app.post("/api/admin/assign/auto-split")
+def auto_split_assignments(admin=Depends(auth.require_admin)):
+    try:
+        assignments = jury_scoring.auto_split_assignments()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"assignments": assignments}
+
+
+class AssignmentUpdate(BaseModel):
+    jury_ids: list[str]
+
+
+@app.get("/api/admin/assign/{sid}")
+def get_assignment(sid: str, admin=Depends(auth.require_admin)):
+    if not db.get_submission(sid):
+        raise HTTPException(404, "Submission not found.")
+    return {
+        "submission_id": sid,
+        "assigned_juries": db.get_assigned_juries(sid),
+        **jury_scoring.reveal_status(sid),
+    }
+
+
+@app.put("/api/admin/assign/{sid}")
+def set_assignment(sid: str, payload: AssignmentUpdate, admin=Depends(auth.require_admin)):
+    if not db.get_submission(sid):
+        raise HTTPException(404, "Submission not found.")
+    db.set_assignment(sid, payload.jury_ids)
+    return {"submission_id": sid, "jury_ids": payload.jury_ids}
+
+
+@app.post("/api/admin/reveal/{sid}")
+def admin_force_reveal(sid: str, admin=Depends(auth.require_admin)):
+    if not db.get_submission(sid):
+        raise HTTPException(404, "Submission not found.")
+    db.force_reveal(sid, admin["id"])
+    return jury_scoring.reveal_status(sid)
+
+
+@app.post("/api/admin/unreveal/{sid}")
+def admin_undo_force_reveal(sid: str, admin=Depends(auth.require_admin)):
+    if not db.get_submission(sid):
+        raise HTTPException(404, "Submission not found.")
+    db.clear_force_reveal(sid)
+    return jury_scoring.reveal_status(sid)
+
+
+# --- Jury scoring --------------------------------------------------------
+
+class JuryDimensionScore(BaseModel):
+    key: str
+    score: int
+    justification: str = ""
+    strengths: list[str] = []
+    concerns: list[str] = []
+
+
+class JuryScoreSubmit(BaseModel):
+    dimension_scores: list[JuryDimensionScore]
+    comment: str = ""
+    judge_flags: list[str] = []
+
+
+@app.get("/api/submissions/{sid}/jury-score")
+def get_jury_score_view(sid: str, user=Depends(auth.current_user)):
+    if not db.get_submission(sid):
+        raise HTTPException(404, "Submission not found.")
+    if user["role"] == "jury" and not jury_scoring.can_jury_access(sid, user["id"]):
+        raise HTTPException(404, "Submission not found.")
+
+    visible = jury_scoring.visible_scores_for(sid, user)
+    name_by_id = {u["id"]: u["display_name"] for u in db.list_users(role="jury")}
+
+    return {
+        "own_score": visible.get(user["id"]) if user["role"] == "jury" else None,
+        "scores": [
+            {"jury_id": jid, "jury_name": name_by_id.get(jid, jid), **s}
+            for jid, s in visible.items()
+        ],
+        **jury_scoring.reveal_status(sid),
+    }
+
+
+@app.post("/api/submissions/{sid}/jury-score")
+def submit_jury_score(sid: str, payload: JuryScoreSubmit, user=Depends(auth.current_user)):
+    if user["role"] != "jury":
+        raise HTTPException(403, "Only jury accounts submit jury scores.")
+    if not db.get_submission(sid):
+        raise HTTPException(404, "Submission not found.")
+    if not jury_scoring.can_jury_access(sid, user["id"]):
+        raise HTTPException(404, "Submission not found.")
+
+    weights = rubrics.get_weights()
+    submitted_keys = {d.key for d in payload.dimension_scores}
+    missing = set(weights) - submitted_keys
+    if missing:
+        raise HTTPException(400, f"Missing scores for dimension(s): {sorted(missing)}")
+    for d in payload.dimension_scores:
+        if not (1 <= d.score <= 10):
+            raise HTTPException(400, f"Score for '{d.key}' must be between 1 and 10.")
+
+    total_weight = sum(weights.values())
+    weighted_total = round(
+        sum(d.score * weights.get(d.key, 0) for d in payload.dimension_scores)
+        / (10 * total_weight) * 100,
+        1,
+    )
+
+    db.upsert_jury_score(
+        sid, user["id"],
+        dimension_scores=[d.dict() for d in payload.dimension_scores],
+        weighted_total=weighted_total,
+        comment=payload.comment,
+        judge_flags=payload.judge_flags,
+    )
+    return get_jury_score_view(sid, user)
+
+
+@app.get("/api/leaderboard/jury")
+def jury_leaderboard_route(user=Depends(auth.current_user)):
+    return jury_scoring.jury_leaderboard()
 
 
 # --- Static frontend -------------------------------------------------

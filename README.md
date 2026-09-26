@@ -218,9 +218,41 @@ needs a new subcommand or flag to route to your adapter.
 - All scores are a **first-pass draft** for the judge, not a final verdict
   — the output always includes per-dimension justification so a human
   can override any score with a clear reason.
-- **Dashboard storage is in-memory** (`web/app.py`'s `SUBMISSIONS` dict) —
-  fine for a single judging session, but it resets on server restart and
-  isn't shared across multiple judges' browsers. Swapping in SQLite
-  (or Postgres for a multi-judge event) means replacing that one dict
-  with real reads/writes — `adapters/`, `models/`, and `scoring/` don't
-  need to change at all.
+- **Dashboard storage is SQLite** (`web/db.py`, `web/data.db`) — shared
+  across every judge and admin hitting the same server, and survives a
+  restart. Delete `web/data.db` to reset everything (submissions, jury
+  accounts, scores, assignments).
+
+## Multi-jury login & synchronized dashboards
+
+Multiple juries can log in independently and judge concurrently against
+the same shared submission pool — every judge sees the same SQLite-backed
+data, live.
+
+**Accounts.** There's no public signup. On first run, an admin account is
+auto-created (see "How to run it" below for the printed credentials).
+Admins create jury accounts from **Judging setup** in the app.
+
+**Judging mode** (admin-selectable, per event, in **Judging setup**):
+- **Split** — each submission is judged by one or more specifically
+  assigned juries. Use **Auto-split** for an even round-robin (e.g. first
+  N submissions → Jury A, next N → Jury B), or assign/reassign individual
+  submissions manually via the chips on that submission's detail page.
+- **All** — every jury account scores every submission. This is the
+  default.
+
+Each jury's own score is independent (not shared live while scoring) —
+the leaderboard combines/averages every jury's score per submission for
+ranking, the same way the AI-engine leaderboard is calibrated
+(`scoring/aggregator.calibrate_pool`).
+
+**Blind scoring.** A jury's score for a submission is hidden from other
+juries until either every jury assigned to that submission has
+submitted their own score, or an admin force-reveals it from the
+submission's detail page (standard judging practice — it keeps scores
+independent instead of anchoring on whoever scores first). Admins can
+always see every score, revealed or not.
+
+**Known nuance:** in "all" mode, the assignment chips aren't shown (every
+jury is implicitly assigned to every submission), so there's nothing to
+configure there beyond adding jury accounts.

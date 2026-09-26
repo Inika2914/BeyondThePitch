@@ -77,6 +77,9 @@ def _client():
     return OpenAI(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
+        timeout=45.0,   # fail loudly instead of hanging forever on a
+                        # slow/overloaded free-tier model
+        max_retries=1,
     )
 
 
@@ -350,6 +353,72 @@ def evaluate(bundle: SubmissionBundle) -> EvaluationResult:
         top_improvements=top_improvements,
         judge_flags=judge_flags,
     )
+
+
+def evaluate_stream(bundle: SubmissionBundle):
+    """Generator version of evaluate() that yields progress events as it
+    goes, so a caller (e.g. the web layer) can stream live status to a
+    client instead of blocking silently until the whole pass finishes.
+
+    Yields dicts of the form:
+      {"stage": "dimension", "status": "start",  "key": ..., "label": ...}
+      {"stage": "dimension", "status": "done",   "key": ..., "label": ..., "score": DimensionScore}
+      {"stage": "dimension", "status": "error",  "key": ..., "label": ..., "error": str}
+      {"stage": "summary",   "status": "start"}
+      {"stage": "summary",   "status": "done"}
+      {"stage": "final",     "result": EvaluationResult}
+
+    Raises the underlying exception after yielding an "error" event for
+    a dimension, so callers can decide how to surface it (the generator
+    stops there — no "final" event follows).
+    """
+
+    client = _client()
+
+    dimension_scores: list[DimensionScore] = []
+    for dim in DIMENSIONS:
+        yield {"stage": "dimension", "status": "start", "key": dim.key, "label": dim.label}
+        try:
+            ds = _score_dimension(client, bundle, dim)
+        except Exception as e:
+            yield {"stage": "dimension", "status": "error", "key": dim.key, "label": dim.label, "error": str(e)}
+            raise
+        dimension_scores.append(ds)
+        yield {"stage": "dimension", "status": "done", "key": dim.key, "label": dim.label, "score": ds}
+
+    weighted_sum = sum(
+        ds.score * dim.weight
+        for ds, dim in zip(dimension_scores, DIMENSIONS)
+    )
+
+    weighted_total = round(
+        (weighted_sum / (10 * total_weight())) * 100,
+        1
+    )
+
+    yield {"stage": "summary", "status": "start"}
+    try:
+        top_strengths, top_improvements, judge_flags = _synthesize_summary(
+            client,
+            bundle,
+            dimension_scores
+        )
+    except Exception as e:
+        yield {"stage": "summary", "status": "error", "error": str(e)}
+        raise
+    yield {"stage": "summary", "status": "done"}
+
+    result = EvaluationResult(
+        team_name=bundle.team_name,
+        project_title=bundle.project_title,
+        dimension_scores=dimension_scores,
+        weighted_total=weighted_total,
+        top_strengths=top_strengths,
+        top_improvements=top_improvements,
+        judge_flags=judge_flags,
+    )
+
+    yield {"stage": "final", "result": result}
 
 
 def result_to_dict(result: EvaluationResult) -> dict:
